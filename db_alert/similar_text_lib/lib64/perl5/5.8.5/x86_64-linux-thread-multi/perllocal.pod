@@ -1,0 +1,22 @@
+=head2 Tue Feb 21 19:49:28 2017: C<Module> L<similar_text|similar_text>
+
+=over 4
+
+=item *
+
+C<installed into: /home/mysql/alert/similar_text_lib/lib/perl5/site_perl/5.8.5>
+
+=item *
+
+C<LINKTYPE: dynamic>
+
+=item *
+
+C<VERSION: 0.01>
+
+=item *
+
+C<EXE_FILES: >
+
+=back
+

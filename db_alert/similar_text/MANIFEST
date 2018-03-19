@@ -1,0 +1,11 @@
+Changes
+Makefile.PL
+MANIFEST
+ppport.h
+README
+similar_text.xs
+t/similar_text.t
+lib/similar_text.pm
+similarity/Makefile.PL
+similarity/similarity.c
+similarity/similarity.h

@@ -1,0 +1,405 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Cwd;
+use JSON;
+use Data::Dumper;
+use Digest::MD5 qw(md5 md5_hex md5_base64);
+use LWP::UserAgent;
+use similar_text;
+
+my $cwd = cwd();
+
+my ($host, $port, $user, $password, $db, $table);
+my ($client_cnf_file, $client, $local_db); 
+
+open CONF, 'publish.conf' or die "faled to open config file publish.conf: $!\n";
+while(<CONF>)
+{
+    if (/^#/ || $_ eq "")
+    {
+        next;
+    }
+
+    if (/host=(.+)/)
+    {
+        $host = $1;
+    }
+    elsif (/port=(\d+)/)
+    {
+        $port = $1;
+    }
+    elsif (/db=(.+)/)
+    {
+        $db = $1;
+    }
+    elsif (/table=(.+)/)
+    {
+        $table = $1;
+    }
+    elsif (/user=(.+)/)
+    {
+        $user = $1;
+    }
+    elsif (/password=(.+)/)
+    {
+        $password = $1;
+    }
+    else
+    {
+        print "unrecognized config: $_\n";
+    }
+}
+
+close CONF;
+
+print "host: $host, port: $port, user: $user, password: $password, db: $db, table: $table\n";
+if ((not defined $host) || (not defined $port)     ||
+    (not defined $user) || (not defined $password) ||
+    (not defined $db)   || (not defined $table))
+{
+    die "Config is not complete!\n";
+}
+
+if (not defined $ARGV[0])
+{
+    print "usage: $0 sql_id sql_id sql_id ...\n";
+    die "At least one parameter should be specified.\n";
+}
+
+# open the config file for connecting mysql on localhost
+open CONF, "alert.conf" or die "conf file does not exist!\n";
+
+while (<CONF>)
+{
+    if (/^#/)
+    {
+        next;
+    }
+
+    if (/interval=(.+)/)
+    {
+    }
+    elsif (/mailto=(.+)/)
+    {
+    }
+    elsif (/client_cnf_file=(.+)/)
+    {
+        $client_cnf_file = $1;
+    }
+    elsif (/client=(.+)/)
+    {
+        $client = $1;
+    }
+    elsif (/db=(.+)/)
+    {
+        $local_db = $1;
+    }
+    else
+    {
+        print "unrecognized config parameter.\n";
+    }
+}
+
+close CONF;
+
+print "client: $client, client_cnf_file: $client_cnf_file, local_db: $local_db\n";
+
+if (! (-e $client))
+{
+    die "error config, client [$client] does not exist.\n";
+}
+
+if (! (-e $client_cnf_file))
+{
+    die "error config, client_cnf_file [$client_cnf_file] does not exist.\n";
+}
+
+my $json = JSON->new->allow_nonref;
+
+# test only
+#for(my $i = 2; $i < 10000; $i++)
+#{
+#    push @ARGV, $i;
+#}
+
+foreach my $sql_id (@ARGV)
+{
+    my $app_name = "";
+
+    my $get_host_sql = "select user, intrude_time, inet_ntoa(dbhost) as dbhost,port, dbname, querycount, md5(sql_text) logstash_id, replace(sql_text, '\n', ' ') ".
+                       "from ids_event where id = $sql_id ".
+                       "into outfile '$cwd/publish.tmp.$sql_id' FIELDS TERMINATED BY '|'";
+    &execute_sql($get_host_sql);
+    my $content = `cat $cwd/publish.tmp.$sql_id`;
+    my ($user_name, $timestamp, $dbhost, $port, $dbname, $querycount, $logstash_id, $sql_text) = split /\|/, $content;
+    $sql_text =~ s/\n$//;
+
+    unlink "$cwd/publish.tmp.$sql_id" or warn "failed to remove file $cwd/publish.tmp.$sql_id\n";
+    if (not defined $dbhost || not defined $port || not defined $dbname)
+    {
+        print "information incomplete, skip this record.\n";
+        next;
+    }
+    print "id: $sql_id, dbhost: $dbhost, port: $port, dbname: $dbname";
+
+    print "URL: curl -XGET 'http://xxx.com/xweb/?r=api/ws/getInstanceInfo&ip=$dbhost&port=$port'\n";
+    my $json_text = `curl -XGET 'http://xxx.com/xweb/?r=api/ws/getInstanceInfo&ip=$dbhost&port=$port' 2> /dev/null`;
+    print "json: $json_text\n";
+    my $scalar =  $json->decode($json_text);
+
+    # or check $scalar->{'success'}
+    if (ref($scalar->{'data'}) eq 'HASH')
+    {
+        $app_name = $scalar->{'data'}->{'app_name'};
+        print "app name: $app_name\n";
+    }
+    else
+    {
+        print "appname is missing for sql [id=$sql_id]\n";
+        next;
+    }
+
+    # get Receiver 
+    print "URL: curl -XGET 'http://xxx.com/xweb/?r=api/ws/getInterface&app_name=$app_name&db_name=$dbname'\n";
+    $json_text = `curl -XGET 'http://xxx.com/xweb/?r=api/ws/getInterface&app_name=$app_name&db_name=$dbname' 2> /dev/null`;
+    print "json: $json_text\n";
+    $scalar =  $json->decode($json_text);
+    # print Dumper $scalar;
+
+    my $dba_list = &get_maillist($scalar, "dba");
+    my $rd_list  = &get_maillist($scalar, "rd");
+    my $op_list  = &get_maillist($scalar, "op");
+
+    print "dba list: $dba_list\n";
+    print "rd list: $rd_list\n";
+    print "op list: $op_list\n";
+
+    my $alarm_type = &get_alarm_type($sql_text);
+    &execute_sql("update ids_event set dba = '$dba_list', rd = '$rd_list', op = '$op_list', alarm_type = '$alarm_type', logstash_id = '$logstash_id', appname = '$app_name' where id = $sql_id");
+
+    # check if there is any the similar SQL
+    &execute_sql("select id, replace(sql_text, '\n', ' ') from dbsec_ids_similar where appname='$app_name' and dbname='$dbname' and status<>2 ".
+                 "into outfile '$cwd/similar.tmp.$sql_id' FIELDS TERMINATED BY '|'");
+    my $file_lines = `cat $cwd/similar.tmp.$sql_id`;
+    unlink "$cwd/similar.tmp.$sql_id";
+    # There is no similar sql, just insert the sql into the similar sql table.
+    my $found_similar_sql = 0;
+    if ($file_lines ne "")
+    {
+        my @lines = split /\n/, $file_lines;
+        foreach my $line (@lines)
+        {
+            my ($similar_sql_id, $similar_sql_text) = split /\|/, $line;
+            my $similarity = similar_text::similar_text ($sql_text, $similar_sql_text);
+            print "similarity: $similarity\n";
+            if ($similarity > 60)
+            {
+                $found_similar_sql = 1;
+                &execute_sql("update ids_event ".
+                             "set cor_id = $similar_sql_id ".
+                             "where id = $sql_id"); 
+                last;
+            }
+        }
+    }
+
+    print "file_lines: $file_lines, found_similar_sql: $found_similar_sql\n";
+
+    if ($file_lines eq "" or !$found_similar_sql)
+    {
+        &execute_sql("insert into dbsec_ids_similar ( ".
+                         "logstash_id, " .
+                         "alarm_type, "  .
+                         "intrude_time, ".
+                         "dbhost, "      .
+                         "port, "        .
+                         "user, "        .
+                         "srchost,"      .
+                         "dbname,"       .
+                         "tblname,"      .
+                         "querycount,"   .
+                         "createtime,"   .
+                         "logtype,"      .
+                         "sql_text,"     .
+                         "appname ) "    .
+                     "select ".
+                         "logstash_id, " .
+                         "alarm_type, "  .
+                         "intrude_time, ".
+                         "dbhost, "      .
+                         "port, "        .
+                         "user, "        .
+                         "srchost,"      .
+                         "dbname,"       .
+                         "tblname,"      .
+                         "querycount,"   .
+                         "createtime,"   .
+                         "logtype,"      .
+                         "sql_text,"     .
+                         "appname "      .
+                     "from ids_event ".
+                     "where id = $sql_id");
+        &execute_sql("update ids_event ".
+                     "set cor_id = (select id from dbsec_ids_similar ".
+                                    "where dbname='$dbname' ".
+                                    " and appname='$app_name' ".
+                                    " and logstash_id='$logstash_id')".
+                     "where id = $sql_id"); 
+
+	    my $host_name = `host $dbhost | awk '{print \$5}'`;
+	    $host_name =~ s/\n$//;
+	    my $json = $json->encode(
+		      { 'alarm_from' => 'Dbasqli',
+			'alarm_type' => 1,
+			'alarm_class'=> 1,
+			'alarm_level'=> 1,
+			'alarm_submittime' => time(),
+			'data'             => { 'username'  => $user_name,
+						'app_name'  => $app_name,
+						'timestamp' => $timestamp,
+						'port'      => $port,
+						'sqli_type' => $alarm_type,
+						'host'      => $host_name,
+						'sql'       => $sql_text,
+						'dbname'    => $dbname, 
+						'count'    => $querycount }
+		      });
+	    print "jason string: $json\n";
+	    my $key="xxx__4WVh5isG";
+	    my $sign_str=uc(md5_hex($key.$json));
+	    my $url="http://xxx.xxx.com:8088/xxx/sign/";
+
+	    print "url: $url$sign_str\n"; 
+
+	    # exit;
+
+	    my $ua = LWP::UserAgent->new;
+	 
+	    # set custom HTTP request header fields
+	    my $req = HTTP::Request->new(POST => $url.$sign_str);
+	    $req->header('content-type' => 'application/json');
+	 
+	    # add POST data to HTTP request body
+	    $req->content($json);
+	 
+	    my $resp = $ua->request($req);
+	    if ($resp->is_success) {
+		my $message = $resp->content;
+		print "Received reply: $message\n";
+		&execute_sql("update ids_event set status = 1 where id = $sql_id"); 
+		&execute_sql("update dbsec_ids_similar set status = 1 ".
+			     "where dbname='$dbname' ".
+			      " and appname='$app_name' ".
+			      " and logstash_id='$logstash_id'");
+	    }
+	    else {
+		print "HTTP POST error code: ", $resp->code, "\n";
+		print "HTTP POST error message: ", $resp->message, "\n";
+	    }
+    }
+}
+
+sub get_maillist()
+{
+    my $scalar = shift; # Json scalar
+    my $role = shift;
+    my $manager = &get_mail($scalar->{'data'}->{$role}->{'manager'});
+    my $interface = &get_mail($scalar->{'data'}->{$role}->{'interface'});;
+    my $mail_list = "";
+
+    #print "$role manager: $manager\n";
+    #print "$role interface: $interface\n";
+
+    if (defined $manager && $manager ne "")
+    {
+        $mail_list .= "$manager,";
+    }
+
+    if (defined $interface && $interface ne "")
+    {
+        $mail_list .= "$interface";
+    }
+
+    $mail_list =~ s/,$//;
+
+    return $mail_list;
+}
+
+sub get_mail()
+{
+    my $ref = shift;
+    my $mails = "";
+
+    if (ref($ref) eq 'ARRAY')
+    {
+        foreach my $mail (@{$ref})
+        {
+            $mails .= "$mail\@xxx.com,";
+        }
+    }
+    else
+    {
+        $mails = "$ref\@xxx.com";
+    }
+
+    $mails =~ s/,$//;
+    return $mails; 
+}
+
+exit;
+
+sub get_alarm_type()
+{
+    my $sql = shift;
+    my $alarm_type;
+
+    if ($sql =~ /^EXPLAIN/i)
+    {
+        $alarm_type = "EXPLAIN";
+    }
+    elsif ($sql =~ /insert.+select/i)
+    {
+        $alarm_type = "SQLCOM_INSERT_SELECT";
+    }
+    elsif ($sql =~ /insert/i)
+    {
+        $alarm_type = "INSERT";
+    }
+    elsif ($sql =~ /select/i)
+    {
+        $alarm_type = "SELECT";
+    }
+    elsif ($sql =~ /UPDATE/i)
+    {
+        $alarm_type = "UPDATE";
+    }
+    else
+    {
+        $alarm_type = "";
+    }
+
+    return $alarm_type;
+}
+
+sub execute_sql()
+{
+    my $sql = shift;
+    my $cmd = "$client --defaults-file=$client_cnf_file $local_db".
+              ' -e "'. $sql. '"';
+
+    print "cmd: $cmd\n";
+    system("$cmd");
+}
+
+sub get_timestamp()
+{
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time());
+
+    return sprintf("%d%02d%02d%02d%02d%02d",
+                   ($year+1900), ($mon+1), ($mday),
+                   $hour, $min, $sec);
+}
+exit;
